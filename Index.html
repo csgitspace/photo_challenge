@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Bitter:wght@400;500;600&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <?!= include('Styles'); ?>
+</head>
+<body>
+  <div class="wrap">
+
+    <header class="masthead">
+      <button type="button" class="manual-open" id="manualBtn"
+              aria-label="How to play">?</button>
+      <h1>SchausHaus<span>Photo Hunt</span></h1>
+      <div class="sub" id="whoami">Loading the logbook&hellip;</div>
+    </header>
+
+    <div class="tabs" role="tablist">
+      <button type="button" class="tab" role="tab" data-view="round" aria-selected="true">Round</button>
+      <button type="button" class="tab" role="tab" data-view="board" aria-selected="false">Standings</button>
+      <button type="button" class="tab" role="tab" data-view="gallery" aria-selected="false">Gallery</button>
+      <button type="button" class="tab" role="tab" data-view="judge" aria-selected="false" id="judgeTab" hidden>Judge</button>
+    </div>
+
+    <main id="view" aria-live="polite">
+      <div class="empty"><p>Opening the logbook&hellip;</p></div>
+    </main>
+
+  </div>
+
+  <input type="file" id="picker" accept="image/*">
+
+  <dialog id="lightbox" aria-label="Photo"></dialog>
+
+  <dialog id="manual" aria-labelledby="manualTitle">
+    <div id="manualBody"></div>
+  </dialog>
+
+  <script>
+    var URL_SLUG = '<?= playerSlug ?>';
+    // JSON.stringify with the force-print scriptlet: the escaping printer
+    // mangles keys containing & < > or quotes.
+    var URL_ADMIN_KEY = <?!= JSON.stringify(adminKey || '') ?>;
+  </script>
+  <?!= include('JavaScript'); ?>
+</body>
+</html>
