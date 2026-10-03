@@ -1,0 +1,938 @@
+<script>
+(function () {
+  'use strict';
+
+  var state = null;
+  var view = 'round';
+  var galleryRound = null;
+  var pending = null;
+  var busy = false;
+
+  var el = document.getElementById('view');
+  var picker = document.getElementById('picker');
+
+  /* ------------------------------------------------------------ identity
+   * Three layers, in order of trust:
+   *   1. ?p= in the URL, if you handed someone a direct link
+   *   2. whatever this browser remembered last time
+   *   3. tap your name on the claim screen
+   * Storage can be blocked inside the Apps Script iframe (Safari especially),
+   * so an in-memory copy keeps the session alive even when it is, and the
+   * claim screen is never more than one tap away.
+   */
+
+  var STORE_KEY = 'schaushaus.player';
+  var memorySlug = '';
+
+  function readSlug() {
+    if (URL_SLUG) return URL_SLUG;
+    try {
+      var v = window.localStorage.getItem(STORE_KEY);
+      if (v) return v;
+    } catch (e) { /* storage blocked */ }
+    return memorySlug;
+  }
+
+  function writeSlug(slug) {
+    memorySlug = slug;
+    try { window.localStorage.setItem(STORE_KEY, slug); } catch (e) { /* fine */ }
+  }
+
+  function forgetSlug() {
+    memorySlug = '';
+    try { window.localStorage.removeItem(STORE_KEY); } catch (e) { /* fine */ }
+  }
+
+  var PLAYER_SLUG = readSlug();
+
+  /* --------------------------------------------------------- judge key
+   * Same three layers as the player identity: the URL if you used a keyed
+   * link, then whatever this browser remembered, then the sign-in form in
+   * the field manual. The server re-checks the key on every call that
+   * matters, so storing it here only saves you retyping it.
+   */
+
+  var ADMIN_STORE_KEY = 'schaushaus.judge';
+  var memoryAdminKey = '';
+
+  function readAdminKey() {
+    if (URL_ADMIN_KEY) return URL_ADMIN_KEY;
+    try {
+      var v = window.localStorage.getItem(ADMIN_STORE_KEY);
+      if (v) return v;
+    } catch (e) { /* storage blocked */ }
+    return memoryAdminKey;
+  }
+
+  function writeAdminKey(key) {
+    memoryAdminKey = key;
+    try { window.localStorage.setItem(ADMIN_STORE_KEY, key); } catch (e) { /* fine */ }
+  }
+
+  function forgetAdminKey() {
+    memoryAdminKey = '';
+    try { window.localStorage.removeItem(ADMIN_STORE_KEY); } catch (e) { /* fine */ }
+  }
+
+  var ADMIN_KEY = readAdminKey();
+
+  /* ------------------------------------------------------------- helpers */
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function untilText(ms) {
+    if (ms <= 0) return 'closed';
+    var mins = Math.floor(ms / 60000);
+    var d = Math.floor(mins / 1440);
+    var h = Math.floor((mins % 1440) / 60);
+    var m = mins % 60;
+    if (d > 0) return d + 'd ' + h + 'h';
+    if (h > 0) return h + 'h ' + m + 'm';
+    return m + 'm';
+  }
+
+  function fmtDay(ms) {
+    var d = new Date(ms);
+    var days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    var h = d.getHours();
+    var ampm = h >= 12 ? 'pm' : 'am';
+    h = h % 12 || 12;
+    var mm = d.getMinutes();
+    return days[d.getDay()] + ' ' + h + (mm ? ':' + (mm < 10 ? '0' : '') + mm : '') + ampm;
+  }
+
+  function notice(msg, bad) {
+    return '<div class="notice' + (bad ? ' bad' : '') + '">' + esc(msg) + '</div>';
+  }
+
+  /* --------------------------------------------------------------- boot */
+
+  function load() {
+    google.script.run
+      .withSuccessHandler(function (s) { state = s; render(); })
+      .withFailureHandler(function (err) {
+        el.innerHTML = notice('Could not open the logbook. ' + err.message, true);
+      })
+      .getState(PLAYER_SLUG, ADMIN_KEY);
+  }
+
+  /* ------------------------------------------------------- field manual */
+
+  var MANUAL_KEY = 'schaushaus.manual';
+  var manualShownThisSession = false;
+
+  function manualSeen() {
+    if (manualShownThisSession) return true;
+    try { return window.localStorage.getItem(MANUAL_KEY) === '1'; } catch (e) { return false; }
+  }
+
+  function markManualSeen() {
+    manualShownThisSession = true;
+    try { window.localStorage.setItem(MANUAL_KEY, '1'); } catch (e) { /* fine */ }
+  }
+
+  function manualHtml() {
+    return [
+      '<p class="eyebrow">Field manual</p>',
+      '<h2 id="manualTitle">How the hunt works</h2>',
+
+      '<div class="manual-week">',
+      '  <div class="leg">',
+      '    <span class="leg-when">Fri 5pm</span>',
+      '    <div><strong>Three prompts drop.</strong> One easy, one that needs you to leave ',
+      '    the building, one strange. Photograph what you like \u2014 all three or just one.</div>',
+      '  </div>',
+      '  <div class="leg">',
+      '    <span class="leg-when">Sun 8pm</span>',
+      '    <div><strong>Submissions close and every photo unlocks at once.</strong> Nobody ',
+      '    sees anything before this, so nobody steals the good idea. Voting opens.</div>',
+      '  </div>',
+      '  <div class="leg">',
+      '    <span class="leg-when">Tue 8pm</span>',
+      '    <div><strong>Votes are counted.</strong> Winners take their bonus, standings ',
+      '    update, and the next round is three days out.</div>',
+      '  </div>',
+      '</div>',
+
+      '<p class="eyebrow" style="margin-top:22px">Points</p>',
+      '<table class="manual-points">',
+      '  <tr><td>Log a photo</td><td class="mono">3</td></tr>',
+      '  <tr><td>Win a prompt\u2019s vote</td><td class="mono">+2</td></tr>',
+      '  <tr><td>Judge\u2019s Choice</td><td class="mono">+2</td></tr>',
+      '  <tr><td>Cast all three votes</td><td class="mono">+1</td></tr>',
+      '</table>',
+
+      '<p class="eyebrow" style="margin-top:22px">Worth knowing</p>',
+      '<ul class="manual-list">',
+      '  <li>One photo per prompt. First frame is the frame \u2014 no re-dos.</li>',
+      '  <li>You cannot vote for yourself. You can change your vote until Tuesday.</li>',
+      '  <li>Votes are anonymous. You will never find out who picked what.</li>',
+      '  <li>Ties split nothing \u2014 everyone tied takes the full bonus.</li>',
+      '  <li>Your worst round gets dropped once three are done. One bad weekend ',
+      '  will not sink you.</li>',
+      '  <li>The last round is worth double, so nobody is out of it until the end.</li>',
+      '</ul>',
+
+      '<p class="eyebrow" style="margin-top:22px">Keep it handy</p>',
+      '<p style="margin:0 0 20px;font-size:14px">Add this page to your home screen and it ',
+      'becomes an icon \u2014 no more hunting through the group chat. On iPhone: Share ',
+      '\u2192 Add to Home Screen. On Android: menu \u2192 Add to Home screen.</p>',
+
+      '<button type="button" class="btn" id="manualClose">Got it</button>',
+
+      '<div class="judge-box">',
+      (state && state.isAdmin
+        ? '<p class="judge-line">Signed in as commissioner. '
+          + '<button type="button" class="linkish dark" id="judgeOut">sign out</button></p>'
+        : '<button type="button" class="linkish dark" id="judgeIn">Commissioner sign-in</button>'),
+      '  <div id="judgeForm"></div>',
+      '</div>'
+    ].join('');
+  }
+
+  function openManual() {
+    var dlg = document.getElementById('manual');
+    var body = document.getElementById('manualBody');
+    body.innerHTML = manualHtml();
+    document.getElementById('manualClose').addEventListener('click', function () {
+      dlg.close();
+    });
+    bindJudgeBox();
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', 'open');
+    markManualSeen();
+  }
+
+  function bindJudgeBox() {
+    var out = document.getElementById('judgeOut');
+    if (out) out.addEventListener('click', function () {
+      forgetAdminKey();
+      ADMIN_KEY = '';
+      document.getElementById('manual').close();
+      load();
+    });
+
+    var inBtn = document.getElementById('judgeIn');
+    if (!inBtn) return;
+
+    inBtn.addEventListener('click', function () {
+      inBtn.hidden = true;
+      var form = document.getElementById('judgeForm');
+      form.innerHTML =
+        '<input type="password" class="caption-input" id="judgeKey" ' +
+        'placeholder="Judge key" autocomplete="off" autocapitalize="off" spellcheck="false">' +
+        '<button type="button" class="btn" id="judgeGo" style="margin-top:8px">Sign in</button>' +
+        '<p class="judge-msg" id="judgeMsg"></p>';
+
+      var input = document.getElementById('judgeKey');
+      var msg = document.getElementById('judgeMsg');
+      input.focus();
+
+      function attempt() {
+        var key = input.value.trim();
+        if (!key) { msg.textContent = 'Enter the key first.'; return; }
+        msg.textContent = 'Checking\u2026';
+
+        google.script.run
+          .withSuccessHandler(function (ok) {
+            if (!ok) {
+              msg.textContent = 'That key does not match. Check Script Properties.';
+              return;
+            }
+            writeAdminKey(key);
+            ADMIN_KEY = key;
+            document.getElementById('manual').close();
+            view = 'judge';
+            load();
+          })
+          .withFailureHandler(function (err) { msg.textContent = err.message; })
+          .verifyAdmin(key);
+      }
+
+      document.getElementById('judgeGo').addEventListener('click', attempt);
+      input.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter') attempt();
+      });
+    });
+  }
+
+  document.getElementById('manualBtn').addEventListener('click', openManual);
+
+  document.getElementById('manual').addEventListener('click', function (ev) {
+    // Clicking the backdrop closes it; clicking the card does not.
+    if (ev.target === this) this.close();
+  });
+
+  /* ------------------------------------------------------------- render */
+
+  function render() {
+    var bar = document.getElementById('whoami');
+    if (state.me) {
+      bar.innerHTML = 'Logged in as ' + esc(state.me.name) +
+        (state.isAdmin ? ' &middot; commissioner' : '') +
+        ' <button type="button" id="switch" class="linkish">not you?</button>';
+    } else if (state.isAdmin) {
+      bar.innerHTML = 'Commissioner &mdash; tap a name to play too ' +
+        '<button type="button" id="switch" class="linkish">pick</button>';
+    } else {
+      bar.textContent = 'Tap your name to start';
+    }
+
+    var sw = document.getElementById('switch');
+    if (sw) sw.addEventListener('click', function () {
+      forgetSlug();
+      PLAYER_SLUG = '';
+      view = 'round';
+      load();
+    });
+
+    if (state.isAdmin) document.getElementById('judgeTab').hidden = false;
+
+    var tabs = document.querySelector('.tabs');
+    if (tabs) tabs.hidden = !(state.me || state.isAdmin);
+
+    Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (t) {
+      t.setAttribute('aria-selected', t.dataset.view === view ? 'true' : 'false');
+    });
+
+    if (!state.me && !state.isAdmin) { renderClaim(); return; }
+
+    // First-timers get the manual unprompted. Once someone has logged a photo
+    // they know the game, so it never auto-opens again regardless of storage.
+    if (state.me) {
+      var mine = state.standings.filter(function (s) { return s.slug === state.me.slug; })[0];
+      if (mine && mine.stamps === 0 && !manualSeen()) openManual();
+    }
+
+    if (view === 'round') renderRound();
+    else if (view === 'board') renderBoard();
+    else if (view === 'gallery') renderGallery();
+    else if (view === 'judge') renderJudge();
+  }
+
+  /** First visit on a device: who is holding this phone? */
+  function renderClaim() {
+    var html = '<div class="card claim">';
+    html += '<p class="eyebrow">Sign the logbook</p>';
+    html += '<h2 style="margin:0 0 4px;font-size:20px">Who\u2019s playing?</h2>';
+    html += '<p style="margin:0 0 18px;font-size:14px;color:var(--bark-soft)">' +
+      'One tap. This browser will remember you next time.</p>';
+    html += '<div class="claim-grid">';
+    state.players.forEach(function (p) {
+      html += '<button type="button" class="btn claim-btn" data-claim="' + esc(p.slug) + '">' +
+        esc(p.name) + '</button>';
+    });
+    html += '</div></div>';
+
+    html += '<div class="card"><p class="eyebrow">New here?</p>' +
+      '<p style="margin:0 0 14px;font-size:14px">The whole game takes a minute to explain ' +
+      'and about thirty seconds a day to play.</p>' +
+      '<button type="button" class="btn ghost" id="claimManual">Read the field manual</button>' +
+      '</div>';
+
+    el.innerHTML = html;
+
+    document.getElementById('claimManual').addEventListener('click', openManual);
+
+    Array.prototype.forEach.call(el.querySelectorAll('[data-claim]'), function (b) {
+      b.addEventListener('click', function () {
+        writeSlug(b.dataset.claim);
+        PLAYER_SLUG = b.dataset.claim;
+        load();
+      });
+    });
+  }
+
+  function renderRound() {
+    var r = state.current;
+    if (!r) {
+      el.innerHTML = '<div class="empty"><p>No rounds on the schedule yet.</p></div>';
+      return;
+    }
+
+    var now = Date.now();
+    var phase = state.phase;
+    var open = phase === 'open';
+    var pre = phase === 'upcoming';
+    var voting = phase === 'voting';
+    var left = (voting ? r.votesCloseAt : r.closesAt) - now;
+    var urgent = (open || voting) && left < 6 * 3600 * 1000;
+
+    var html = '<div class="card">';
+    html += '<span class="placard">' + esc(r.roundId) + ' &middot; ' + esc(r.title) + '</span>';
+
+    if (pre) {
+      html += '<div class="countdown">Opens <strong>' + fmtDay(r.opensAt) + '</strong></div>';
+    } else if (open) {
+      html += '<div class="countdown' + (urgent ? ' urgent' : '') + '">Submissions close ' +
+        fmtDay(r.closesAt) + ' &middot; <strong>' + untilText(left) + ' left</strong></div>';
+    } else if (voting) {
+      html += '<div class="countdown' + (urgent ? ' urgent' : '') + '">Voting closes ' +
+        fmtDay(r.votesCloseAt) + ' &middot; <strong>' + untilText(left) + ' left</strong></div>';
+    } else {
+      html += '<div class="countdown">Settled ' + fmtDay(r.votesCloseAt) + '</div>';
+    }
+
+    if (r.multiplier > 1 && !pre) {
+      html += notice('Final round. Every point counts double.');
+    }
+    html += '</div>';
+
+    // During voting the round screen's job is to push you to the ballot.
+    if (voting) {
+      html += '<div class="card ballot-call">';
+      if (!state.me) {
+        html += '<p style="margin:0">Tap your name to vote.</p>';
+      } else if (state.ballotLeft > 0) {
+        html += '<p class="eyebrow">Your ballot</p>';
+        html += '<h2 style="margin:0 0 6px;font-size:20px">' + state.ballotLeft +
+          (state.ballotLeft === 1 ? ' vote left' : ' votes left') + '</h2>';
+        html += '<p style="margin:0 0 14px;font-size:14px;color:var(--bark-soft)">' +
+          'Pick a favourite in each prompt. Cast all three and you take a bonus point.</p>';
+        html += '<button type="button" class="btn" id="toVote">Go vote</button>';
+      } else {
+        html += '<span class="stamp">Ballot cast</span>';
+        html += '<p style="margin:14px 0 0;font-size:14px;color:var(--bark-soft)">' +
+          'You have voted in every prompt. Results post ' + fmtDay(r.votesCloseAt) +
+          '. You can still change your mind until then.</p>';
+      }
+      html += '</div>';
+    }
+
+    if (pre) {
+      html += '<div class="card sealed">';
+      html += '<span class="stamp sealed-stamp">Sealed</span>';
+      html += '<p style="margin:14px 0 0;font-size:14px;color:var(--bark-soft)">' +
+        state.currentPrompts.length + ' prompts, held until ' + fmtDay(r.opensAt) +
+        '. They are not on this device yet \u2014 no point looking.</p>';
+      html += '</div>';
+      el.innerHTML = html;
+      return;
+    }
+
+    html += '<div class="card">';
+    state.currentPrompts.forEach(function (p) {
+      html += '<div class="prompt">';
+      html += '<span class="tag ' + esc(p.tag) + '">' + esc(p.tag) + '</span>';
+      html += '<div class="prompt-body">';
+      html += '<p class="prompt-text">' + esc(p.text) + '</p>';
+
+      if (p.submitted) {
+        html += '<span class="stamp">Logged</span>';
+      } else if (!open) {
+        html += '<span class="dropped">Missed \u2014 submissions closed</span>';
+      } else if (!state.me) {
+        html += '<span class="dropped">Open your player link to submit</span>';
+      } else {
+        html += '<button type="button" class="btn" data-submit="' + esc(p.promptId) + '">' +
+          'Add photo</button>';
+      }
+      html += '</div></div>';
+    });
+    html += '</div>';
+
+    if (open && state.me) {
+      var done = state.currentPrompts.filter(function (p) { return p.submitted; }).length;
+      html += '<p class="mono" style="font-size:12px;color:var(--leather);text-align:center">' +
+        done + ' of ' + state.currentPrompts.length + ' logged this round</p>';
+    }
+
+    el.innerHTML = html;
+
+    Array.prototype.forEach.call(el.querySelectorAll('[data-submit]'), function (b) {
+      b.addEventListener('click', function () { startSubmit(b.dataset.submit); });
+    });
+
+    var toVote = document.getElementById('toVote');
+    if (toVote) toVote.addEventListener('click', function () {
+      galleryRound = r.roundId;
+      view = 'gallery';
+      render();
+    });
+  }
+
+  function renderBoard() {
+    var closed = state.rounds.filter(function (r) { return r.closesAt <= Date.now(); }).length;
+    var html = '<div class="card"><p class="eyebrow">Season standings</p>';
+    html += '<table class="board"><thead><tr>' +
+      '<th></th><th>Player</th><th>Rounds</th><th style="text-align:right">Pts</th>' +
+      '</tr></thead><tbody>';
+
+    state.standings.forEach(function (s, i) {
+      var cls = [];
+      if (i === 0 && s.total > 0) cls.push('leader');
+      if (state.me && s.slug === state.me.slug) cls.push('self');
+
+      var slots = '<span class="slots">';
+      s.perRound.forEach(function (pr) {
+        var filled = pr.points > 0;
+        var c = 'slot' + (filled ? (pr.counted ? ' filled' : '') : '');
+        slots += '<span class="' + c + '" title="' + esc(pr.roundId) + ': ' + pr.points + '"></span>';
+      });
+      slots += '</span>';
+
+      html += '<tr class="' + cls.join(' ') + '">';
+      html += '<td class="rank">' + (i + 1) + '</td>';
+      html += '<td class="who">' + esc(s.name) + '</td>';
+      html += '<td>' + slots + '</td>';
+      html += '<td class="score">' + s.total + '</td>';
+      html += '</tr>';
+    });
+
+    html += '</tbody></table>';
+
+    if (closed >= 3) {
+      html += '<p class="dropped" style="margin:12px 0 0">' +
+        'Weakest closed round is dropped from each total.</p>';
+    }
+    html += '</div>';
+
+    html += '<div class="card" style="text-align:center">' +
+      '<button type="button" class="btn ghost" id="boardManual">How points work</button>' +
+      '</div>';
+
+    el.innerHTML = html;
+
+    document.getElementById('boardManual').addEventListener('click', openManual);
+  }
+
+  function renderGallery() {
+    // Default to the newest round people can actually look at. state.current
+    // skips ahead to the next upcoming round once one finishes, which would
+    // land you on an empty gallery.
+    var rid = galleryRound;
+    if (!rid) {
+      var visible = state.rounds.filter(function (r) {
+        return r.phase === 'voting' || r.phase === 'final';
+      });
+      // Prefer a round that is actively taking votes.
+      var live = visible.filter(function (r) { return r.phase === 'voting'; });
+      if (live.length) rid = live[live.length - 1].roundId;
+      else if (visible.length) rid = visible[visible.length - 1].roundId;
+      else if (state.current) rid = state.current.roundId;
+    }
+    if (!rid) {
+      el.innerHTML = '<div class="empty"><p>Nothing photographed yet.</p></div>';
+      return;
+    }
+
+    var picker = '<div class="card"><p class="eyebrow">Round</p>' +
+      '<div style="display:flex;gap:6px;flex-wrap:wrap">';
+    state.rounds.forEach(function (r) {
+      var on = r.roundId === rid;
+      var mark = r.phase === 'voting' ? ' \u25CF' : '';
+      picker += '<button type="button" class="btn' + (on ? '' : ' ghost') +
+        '" data-round="' + esc(r.roundId) + '" style="padding:7px 12px;font-size:11px">' +
+        esc(r.roundId) + mark + '</button>';
+    });
+    picker += '</div></div>';
+
+    el.innerHTML = picker + '<div class="empty"><p>Developing&hellip;</p></div>';
+    bindRoundPicker();
+
+    google.script.run
+      .withSuccessHandler(function (data) {
+        var html = picker;
+
+        var voting = data.phase === 'voting';
+        var settled = data.phase === 'final';
+
+        if (data.phase === 'upcoming' || data.phase === 'open') {
+          html += '<div class="card sealed"><span class="stamp sealed-stamp">Sealed</span>' +
+            '<p style="margin:14px 0 0;font-size:14px;color:var(--bark-soft)">' +
+            'Every photo from this round stays locked until submissions close \u2014 ' +
+            'including your own. Nobody gets a look at what anyone else did.</p></div>';
+          el.innerHTML = html;
+          bindRoundPicker();
+          return;
+        }
+
+        if (!data.items.length) {
+          html += '<div class="empty"><p>Nothing logged for this round.</p></div>';
+          el.innerHTML = html;
+          bindRoundPicker();
+          return;
+        }
+
+        if (voting) {
+          if (!state.me) {
+            html += '<div class="notice bad"><strong>You are not signed in as a player, ' +
+              'so there are no vote buttons.</strong> Use the &ldquo;pick&rdquo; link at ' +
+              'the top of the page to tap your name, then come back here.</div>';
+          } else {
+            html += '<div class="vote-howto">' +
+              '<p class="eyebrow">Voting is open</p>' +
+              '<p><strong>Press the green button under a photo to vote for it.</strong> ' +
+              'One pick in each of the three prompts below. You cannot pick your own, ' +
+              'and you can change your mind until ' + esc(fmtDay(data.votesCloseAt)) +
+              '.</p></div>';
+          }
+        } else if (settled) {
+          html += '<div class="notice"><strong>Voting on this round is closed</strong> \u2014 ' +
+            'it ended ' + esc(fmtDay(data.votesCloseAt)) + ', so there are no vote ' +
+            'buttons. The counts below are final.</div>';
+        }
+
+        var groups = {};
+        data.items.forEach(function (it) {
+          if (!groups[it.promptId]) groups[it.promptId] = { prompt: it, items: [] };
+          groups[it.promptId].items.push(it);
+        });
+
+        Object.keys(groups).sort().forEach(function (pid) {
+          var g = groups[pid];
+          html += '<div class="group-head"><h3 class="tag ' + esc(g.prompt.tag) +
+            '" style="border:0;padding:0">' + esc(g.prompt.tag) + '</h3>' +
+            '<p>' + esc(g.prompt.prompt) + '</p></div>';
+          html += '<div class="grid' + (voting ? ' voting' : '') + '">';
+
+          g.items.forEach(function (it) {
+            var cls = 'shot';
+            if (settled && it.popular) cls += ' winner';
+            if (it.votedFor) cls += ' picked';
+            if (voting && it.mine) cls += ' own';
+
+            html += '<figure class="' + cls + '" style="margin:0">';
+            if (settled && it.popular) html += '<span class="ribbon">Most votes</span>';
+            else if (settled && it.award) html += '<span class="ribbon leather">Judge\u2019s pick</span>';
+
+            var canVote = voting && state.me && !it.mine;
+
+            // The photo is tappable too, but the button below is the real
+            // instruction — it has to be visible without scrolling the card.
+            var tagName = canVote ? 'button' : 'div';
+            var attrs = canVote
+              ? ' type="button" class="shot-tap" data-vote="' + esc(it.promptId) +
+                '" data-choice="' + esc(it.slug) + '" tabindex="-1" aria-hidden="true"'
+              : ' class="shot-tap" data-view-photo="' + esc(it.subId) + '"';
+
+            html += '<' + tagName + attrs + '>';
+            html += '<img loading="lazy" data-sub="' + esc(it.subId) + '" src="' +
+              esc(it.thumbUrl) + '" alt="' + esc(it.name + ' \u2014 ' + it.prompt) + '">';
+            html += '</' + tagName + '>';
+
+            html += '<figcaption class="meta"><span>' + esc(it.name) + '</span>';
+            if (settled && it.votes !== null) {
+              html += '<span class="mono">' + it.votes +
+                (it.votes === 1 ? ' vote' : ' votes') + '</span>';
+            } else if (it.caption) {
+              html += '<span>' + esc(it.caption) + '</span>';
+            }
+            html += '</figcaption>';
+
+            if (voting) {
+              if (it.mine) {
+                html += '<p class="own-label">Your photo</p>';
+              } else if (!state.me) {
+                html += '<p class="own-label">Tap your name to vote</p>';
+              } else if (it.votedFor) {
+                html += '<button type="button" class="vote-big is-picked" ' +
+                  'data-vote="' + esc(it.promptId) + '" data-choice="' + esc(it.slug) +
+                  '" aria-pressed="true">\u2713 Your pick</button>';
+              } else {
+                html += '<button type="button" class="vote-big" ' +
+                  'data-vote="' + esc(it.promptId) + '" data-choice="' + esc(it.slug) +
+                  '" aria-pressed="false">Vote for ' + esc(it.name) + '</button>';
+              }
+            }
+            html += '</figure>';
+          });
+          html += '</div>';
+        });
+
+        el.innerHTML = html;
+        bindRoundPicker();
+        bindVoteButtons();
+        bindPhotoFallback();
+        bindPhotoViewer();
+      })
+      .withFailureHandler(function (err) {
+        el.innerHTML = picker + notice('Gallery would not load. ' + err.message, true);
+        bindRoundPicker();
+      })
+      .getGallery(rid, PLAYER_SLUG, ADMIN_KEY);
+  }
+
+  /**
+   * If a Drive thumbnail fails to load — usually because link sharing was
+   * blocked on upload — fetch the bytes through the web app instead. Each
+   * image heals itself, so a sharing policy cannot hide the gallery.
+   */
+  function bindPhotoFallback() {
+    Array.prototype.forEach.call(el.querySelectorAll('img[data-sub]'), function (img) {
+      var tried = false;
+      img.addEventListener('error', function () {
+        if (tried) { img.classList.add('img-dead'); return; }
+        tried = true;
+        img.classList.add('img-loading');
+        google.script.run
+          .withSuccessHandler(function (dataUrl) {
+            img.classList.remove('img-loading');
+            img.src = dataUrl;
+          })
+          .withFailureHandler(function () {
+            img.classList.remove('img-loading');
+            img.classList.add('img-dead');
+          })
+          .getPhotoData(img.dataset.sub, false);
+      });
+      // Drive sometimes returns a 1x1 placeholder rather than erroring.
+      img.addEventListener('load', function () {
+        if (img.naturalWidth <= 2 && !tried) {
+          tried = true;
+          google.script.run
+            .withSuccessHandler(function (d) { img.src = d; })
+            .withFailureHandler(function () { img.classList.add('img-dead'); })
+            .getPhotoData(img.dataset.sub, false);
+        }
+      });
+    });
+  }
+
+  /** Full-size view inside the app, so nobody gets bounced out to Drive. */
+  function bindPhotoViewer() {
+    Array.prototype.forEach.call(el.querySelectorAll('[data-view-photo]'), function (box) {
+      box.addEventListener('click', function () {
+        var sub = box.dataset.viewPhoto;
+        var lb = document.getElementById('lightbox');
+        lb.innerHTML = '<div class="lb-inner"><p class="lb-wait">Loading\u2026</p></div>';
+        if (typeof lb.showModal === 'function') lb.showModal();
+
+        google.script.run
+          .withSuccessHandler(function (dataUrl) {
+            lb.innerHTML = '<div class="lb-inner"><img src="' + dataUrl + '" alt="">' +
+              '<button type="button" class="btn" id="lbClose">Close</button></div>';
+            document.getElementById('lbClose').addEventListener('click', function () {
+              lb.close();
+            });
+          })
+          .withFailureHandler(function (err) {
+            lb.innerHTML = '<div class="lb-inner"><p class="lb-wait">' +
+              esc(err.message) + '</p>' +
+              '<button type="button" class="btn" id="lbClose">Close</button></div>';
+            document.getElementById('lbClose').addEventListener('click', function () {
+              lb.close();
+            });
+          })
+          .getPhotoData(sub, true);
+      });
+    });
+  }
+
+  function bindRoundPicker() {
+    Array.prototype.forEach.call(el.querySelectorAll('[data-round]'), function (b) {
+      b.addEventListener('click', function () {
+        galleryRound = b.dataset.round;
+        renderGallery();
+      });
+    });
+  }
+
+  function bindVoteButtons() {
+    Array.prototype.forEach.call(el.querySelectorAll('[data-vote]'), function (b) {
+      if (b.disabled) return;
+      b.addEventListener('click', function () {
+        if (busy) return;
+        busy = true;
+        b.disabled = true;
+        if (b.classList.contains('vote-big')) {
+          b.innerHTML = '<span class="spinner"></span>Saving';
+        } else {
+          b.innerHTML = '<span class="spinner"></span>';
+        }
+
+        google.script.run
+          .withSuccessHandler(function () {
+            // Refresh the ballot counter, then redraw the gallery.
+            google.script.run
+              .withSuccessHandler(function (s) {
+                state = s;
+                busy = false;
+                renderGallery();
+              })
+              .withFailureHandler(function () { busy = false; renderGallery(); })
+              .getState(PLAYER_SLUG, ADMIN_KEY);
+          })
+          .withFailureHandler(function (err) {
+            busy = false;
+            renderGallery();
+            el.insertAdjacentHTML('afterbegin', notice(err.message, true));
+          })
+          .castVote(b.dataset.vote, b.dataset.choice, PLAYER_SLUG);
+      });
+    });
+  }
+
+  function renderJudge() {
+    var html = '<div class="card"><p class="eyebrow">Server status</p>';
+    html += '<table class="board" style="margin-bottom:10px"><tbody>';
+    state.rounds.forEach(function (r) {
+      html += '<tr><td class="who">' + esc(r.roundId) + '</td>' +
+        '<td><span class="phase-tag ' + esc(r.phase) + '">' + esc(r.phase) + '</span></td>' +
+        '<td class="mono" style="font-size:11px;text-align:right">' +
+        (r.phase === 'voting' ? 'votes end ' + esc(fmtDay(r.votesCloseAt))
+          : r.phase === 'open' ? 'closes ' + esc(fmtDay(r.closesAt))
+          : r.phase === 'upcoming' ? 'opens ' + esc(fmtDay(r.opensAt))
+          : 'ended ' + esc(fmtDay(r.votesCloseAt))) +
+        '</td></tr>';
+    });
+    html += '</tbody></table>';
+    html += '<p style="margin:0;font-size:13px;color:var(--bark-soft)">Vote buttons only ' +
+      'appear on a round in the <strong>voting</strong> phase. If one expired early, run ' +
+      '<span class="mono">extendVoting(\'R1\', 48)</span> in the script editor.</p></div>';
+
+    html += '<div class="card"><p class="eyebrow">Season opener</p>' +
+      '<p style="margin:0 0 12px;font-size:14px">Send this once, before Round 1.</p>' +
+      '<button type="button" class="btn ghost" id="introBtn" ' +
+      'style="padding:7px 12px;font-size:11px">Write the intro</button>' +
+      '<div id="introBox"></div></div>';
+
+    html += '<div class="card"><p class="eyebrow">Group chat drafts</p>' +
+      '<p style="margin:0 0 12px;font-size:14px">Pick a round, then copy the message you need.</p>' +
+      '<div style="display:flex;gap:6px;flex-wrap:wrap">';
+    state.rounds.forEach(function (r) {
+      html += '<button type="button" class="btn ghost" data-draft="' + esc(r.roundId) +
+        '" style="padding:7px 12px;font-size:11px">' + esc(r.roundId) + '</button>';
+    });
+    html += '</div><div id="drafts"></div></div>';
+
+    html += '<div class="card"><p class="eyebrow">Judge\u2019s Choice</p>' +
+      '<p style="margin:0;font-size:14px">Open the Gallery after a round closes, then award ' +
+      'from there. One pick per prompt, worth 2 points.</p></div>';
+
+    el.innerHTML = html;
+
+    document.getElementById('introBtn').addEventListener('click', function () {
+      var box = document.getElementById('introBox');
+      box.innerHTML = '<p class="dropped">Writing&hellip;</p>';
+      google.script.run
+        .withSuccessHandler(function (t) {
+          box.innerHTML = '<div class="draft">' + esc(t) + '</div>';
+        })
+        .withFailureHandler(function (err) {
+          box.innerHTML = notice('Draft failed. ' + err.message, true);
+        })
+        .draftIntro();
+    });
+
+    Array.prototype.forEach.call(el.querySelectorAll('[data-draft]'), function (b) {
+      b.addEventListener('click', function () {
+        var box = document.getElementById('drafts');
+        box.innerHTML = '<p class="dropped">Writing&hellip;</p>';
+        google.script.run
+          .withSuccessHandler(function (t) {
+            box.innerHTML =
+              '<p class="eyebrow" style="margin-top:16px">Friday drop</p>' +
+              '<div class="draft">' + esc(t.drop) + '</div>' +
+              '<p class="eyebrow" style="margin-top:16px">Saturday nudge</p>' +
+              '<div class="draft">' + esc(t.nudge) + '</div>' +
+              '<p class="eyebrow" style="margin-top:16px">Sunday reveal \u2014 voting opens</p>' +
+              '<div class="draft">' + esc(t.reveal) + '</div>' +
+              '<p class="eyebrow" style="margin-top:16px">Tuesday results</p>' +
+              '<div class="draft">' + esc(t.results) + '</div>';
+          })
+          .withFailureHandler(function (err) {
+            box.innerHTML = notice('Draft failed. ' + err.message, true);
+          })
+          .draftTexts(b.dataset.draft, ADMIN_KEY);
+      });
+    });
+  }
+
+  /* --------------------------------------------------------- submission */
+
+  function startSubmit(promptId) {
+    if (busy) return;
+    pending = promptId;
+    picker.value = '';
+    picker.click();
+  }
+
+  picker.addEventListener('change', function () {
+    var file = picker.files && picker.files[0];
+    if (!file || !pending) return;
+    resize(file, 1400, 0.82, function (full) {
+      resize(file, 500, 0.7, function (thumb) {
+        upload(pending, full, thumb);
+      });
+    });
+  });
+
+  /** Shrinks on the phone so uploads finish on bad wifi. */
+  function resize(file, maxEdge, quality, done) {
+    var reader = new FileReader();
+    reader.onload = function () {
+      var img = new Image();
+      img.onload = function () {
+        var scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
+        var w = Math.round(img.width * scale);
+        var h = Math.round(img.height * scale);
+        var canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        done(canvas.toDataURL('image/jpeg', quality).split(',')[1]);
+      };
+      img.onerror = function () { fail('That file did not open as an image.'); };
+      img.src = reader.result;
+    };
+    reader.onerror = function () { fail('Could not read that file.'); };
+    reader.readAsDataURL(file);
+  }
+
+  function upload(promptId, full, thumb) {
+    busy = true;
+    var btn = el.querySelector('[data-submit="' + promptId + '"]');
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>Logging';
+    }
+
+    google.script.run
+      .withSuccessHandler(function (s) {
+        state = s;
+        busy = false;
+        pending = null;
+        renderRound();
+        var stamps = el.querySelectorAll('.stamp');
+        if (stamps.length) stamps[stamps.length - 1].classList.add('fresh');
+      })
+      .withFailureHandler(function (err) {
+        busy = false;
+        pending = null;
+        renderRound();
+        el.insertAdjacentHTML('afterbegin', notice(err.message, true));
+      })
+      .submitPhoto({
+        slug: PLAYER_SLUG,
+        promptId: promptId,
+        full: full,
+        thumb: thumb,
+        caption: '',
+        adminKey: ADMIN_KEY
+      });
+  }
+
+  function fail(msg) {
+    busy = false;
+    pending = null;
+    el.insertAdjacentHTML('afterbegin', notice(msg, true));
+  }
+
+  /* --------------------------------------------------------------- tabs */
+
+  Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (t) {
+    t.addEventListener('click', function () {
+      view = t.dataset.view;
+      render();
+    });
+  });
+
+  load();
+  setInterval(function () { if (view === 'round' && !busy) renderRound(); }, 60000);
+})();
+</script>
